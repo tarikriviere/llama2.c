@@ -29,6 +29,7 @@ typedef struct {
     int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
     int vocab_size; // vocabulary size, usually 256 (byte-level)
     int seq_len; // max sequence length
+    int nb_groups; // nb of groups
 } Config;
 
 typedef struct {
@@ -58,6 +59,27 @@ typedef struct {
     // (optional) classifier weights for the logits, on the last layer
     QuantizedTensor *wcls;
 } TransformerWeights;
+
+typedef struct {
+    // token embedding table
+    float* token_embedding_table;    // (vocab_size, dim)
+    // weights for rmsnorms
+    float* rms_att_weight; // (layer, dim) rmsnorm weights
+    float* rms_ffn_weight; // (layer, dim)
+    // weights for matmuls. note dim == n_heads * head_size
+    float* wq; // (layer, dim, n_heads * head_size)
+    float* wk; // (layer, dim, n_kv_heads * head_size)
+    float* wv; // (layer, dim, n_kv_heads * head_size)
+    float* wo; // (layer, n_heads * head_size, dim)
+    // weights for ffn
+    float* w1; // (layer, hidden_dim, dim)
+    float* w2; // (layer, dim, hidden_dim)
+    float* w3; // (layer, hidden_dim, dim)
+    // final rmsnorm
+    float* rms_final_weight; // (dim,)
+    // (optional) classifier weights for the logits, on the last layer
+    float* wcls;
+} TransformerFWeights;
 
 typedef struct {
     // current wave of activations
@@ -1034,6 +1056,7 @@ int main(int argc, char *argv[]) {
     unsigned long long rng_seed = 0; // seed rng with time by default
     char *mode = "generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
+    int quantizing_mode = 0;
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -1051,6 +1074,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'q') { quantizing_mode = atoi(argv[i + 1]); }
         else { error_usage(); }
     }
 
@@ -1062,7 +1086,12 @@ int main(int argc, char *argv[]) {
 
     // build the Transformer via the model .bin file
     Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
+    build_transformer(&transformer, checkpoint_path, quantizing_mode);
+
+    if (quantizing_mode == 1) {
+        return 0;
+    }
+
     if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // override to ~max length
 
     // build the Tokenizer via the tokenizer .bin file
