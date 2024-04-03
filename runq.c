@@ -259,7 +259,9 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerFWeights* weig
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
+    
     GS = config->dim;
+    config->nb_groups = GS;
 }
 
 QuantizedTensor *quantize_tensor(void *f, int n, int size_each) {
@@ -318,7 +320,7 @@ void export_float(float *in, FILE **ptr, int size) {
 void import_transformer(char* quantized_checkpoint, Config* p, TransformerWeights* w) {
     size_t err;
 
-    FILE *ptr = fopen(quantized_checkpoint, "wb");
+    FILE *ptr = fopen(quantized_checkpoint, "rb");
     if (!ptr) { fprintf(stderr, "Couldn't open file %s\n", quantized_checkpoint); exit(EXIT_FAILURE); }
 
     err = fread(&p->dim, sizeof(int), 1, ptr);
@@ -431,7 +433,7 @@ void build_transformer(Transformer *t, char* checkpoint_path, int quantizing_mod
 
     } else {
 
-        // 
+        // importing an already quantized transformer
         import_transformer(checkpoint_path, &t->config, &t->weights);
 
         // allocate the RunState buffers
