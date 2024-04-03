@@ -299,6 +299,20 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
     return res;
 }
 
+QuantizedTensor *quantize_tensor(void *f, int n, int size_each) {
+    QuantizedTensor *res = calloc(n,  sizeof(QuantizedTensor));
+    
+    for(int i=0; i<n; i++) {
+        res[i].q = calloc(size_each,  sizeof(int8_t));
+        res[i].s = calloc(size_each / GS,  sizeof(float));
+
+        quantize(&res[i], f + size_each*i, size_each);
+    }
+
+    return res;
+}
+
+
 QuantizedTensor *import_tensor(FILE **ptr, int n, int size_each) {
     QuantizedTensor *res = calloc(n,  sizeof(QuantizedTensor));
     
@@ -415,12 +429,29 @@ void export_transformer(char* checkpoint, Config* p, TransformerWeights* weights
     fclose(ptr);
 }
 
-void quantize_transformer(char* checkpoint, Config* config, TransformerFWeights* f_weights) {
+void quantize_transformer(TransformerWeights* w, TransformerFWeights* o, Config *p) {
 
+    int head_size = p->dim / p->n_heads;
 
+    w->rms_att_weight = o->rms_att_weight;
+    w->rms_ffn_weight = o->rms_ffn_weight;
+    w->rms_final_weight = o->rms_final_weight;
 
+    w->q_tokens = quantize_tensor(o->q_tokens, 1, p->vocab_size * p->dim);
+    w->token_embedding_table = o->token_embedding_table;
 
-}
+    w->wq = quantize_tensor(o->wq, p->n_layers, p->dim * (p->n_heads * head_size));
+    w->wk = quantize_tensor(o->wk, p->n_layers, p->dim * (p->n_kv_heads * head_size));
+    w->wv = quantize_tensor(o->wv, p->n_layers, p->dim * (p->n_kv_heads * head_size));
+    w->wo = quantize_tensor(o->wo, p->n_layers, (p->n_heads * head_size) * p->dim);
+
+    w->w1 = quantize_tensor(o->w1, p->n_layers, p->dim * p->hidden_dim);
+    w->w2 = quantize_tensor(o->w2, p->n_layers, p->hidden_dim * p->dim);
+    w->w3 = quantize_tensor(o->w3, p->n_layers, p->dim * p->hidden_dim);
+
+    w->wcls = quantize_tensor(o->wcls, 1, p->dim * p->vocab_size);
+
+    fclose(p);
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
@@ -429,10 +460,34 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
     malloc_run_state(&t->state, &t->config);
 }
 
-void free_transformer(Transformer* t) {
-    // free QuantizedTensors
+void free_transformer(Transformer* t, Config* p) {
+
+    for (int i = 0; i < p->n_layers; i++) {
+        free(t->weights.wq[i].q);
+        free(t->weights.wq[i].s);
+
+        free(t->weights.wk[i].q);
+        free(t->weights.wk[i].s);
+        
+        free(t->weights.wv[i].q);
+        free(t->weights.wv[i].s);
+
+        free(t->weights.wo[i].q);
+        free(t->weights.wo[i].s);
+
+        free(t->weights.w1[i].q);
+        free(t->weights.w1[i].s);
+
+        free(t->weights.w2[i].q);
+        free(t->weights.w2[i].s);
+
+        free(t->weights.w3[i].q);
+        free(t->weights.w3[i].s);
+    }
+
     free(t->weights.q_tokens);
     free(t->weights.token_embedding_table);
+
     free(t->weights.wq);
     free(t->weights.wk);
     free(t->weights.wv);
@@ -440,6 +495,11 @@ void free_transformer(Transformer* t) {
     free(t->weights.w1);
     free(t->weights.w2);
     free(t->weights.w3);
+    
+    free(t->weights.rms_att_weight);
+    free(t->weights.rms_ffn_weight);
+    free(t->weights.rms_final_weight);
+
     if(t->weights.wcls != t->weights.q_tokens) { free(t->weights.wcls); }
     // close the memory mapping
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
