@@ -110,16 +110,6 @@ typedef struct {
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
-typedef struct {
-    Config config; // the hyperparameters of the architecture (the blueprint)
-    TransformerFWeights weights; // the weights of the model
-    RunState state; // buffers for the "wave" of activations in the forward pass
-    // some more state needed to properly clean up the memory mapping (sigh)
-    int fd; // file descriptor for memory mapping
-    float* data; // memory mapped data pointer
-    ssize_t file_size; // size of the checkpoint file in bytes
-} TransformerF;
-
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -280,23 +270,6 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerFWeights* weig
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     void* weights_ptr = ((char*)*data) + header_size; // skip header bytes. char is 1 byte
     memory_map_weights(weights, config, weights_ptr, shared_classifier);
-    export_transformer(checkpoint, config, weights);
-}
-
-/* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
-QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
-    void *p = *ptr;
-    QuantizedTensor *res = calloc(n,  sizeof(QuantizedTensor));
-    for(int i=0; i<n; i++) {
-        /* map quantized int8 values*/
-        res[i].q = (int8_t*)p;
-        p = (int8_t*)p + size_each;
-        /* map scale factors */
-        res[i].s = (float*)p;
-        p = (float*)p + size_each / GS;
-    }
-    *ptr = p; // advance ptr to current position
-    return res;
 }
 
 QuantizedTensor *quantize_tensor(void *f, int n, int size_each) {
@@ -327,7 +300,7 @@ QuantizedTensor *import_tensor(FILE **ptr, int n, int size_each) {
     return res;
 }
 
-void *import_float(FILE **ptr, int size, TransformerWeights* w) {
+void *import_float(FILE **ptr, int size) {
 
     float *res = calloc(sizeof(float), size);
     fread(res, sizeof(float), size, *ptr);
@@ -387,11 +360,9 @@ void import_transformer(char* quantized_checkpoint, Config* p, TransformerWeight
     fclose(ptr);
 }
 
-void export_transformer(char* checkpoint, Config* p, TransformerWeights* weights) {
+void export_transformer(char* checkpoint, Config* p, TransformerWeights* w) {
 
     int head_size = p->dim / p->n_heads;
-
-    TransformerWeights weights;
 
     char export_file[256];
     strcpy(export_file, checkpoint);
@@ -437,7 +408,7 @@ void quantize_transformer(TransformerWeights* w, TransformerFWeights* o, Config 
     w->rms_ffn_weight = o->rms_ffn_weight;
     w->rms_final_weight = o->rms_final_weight;
 
-    w->q_tokens = quantize_tensor(o->q_tokens, 1, p->vocab_size * p->dim);
+    w->q_tokens = quantize_tensor(o->token_embedding_table, 1, p->vocab_size * p->dim);
     w->token_embedding_table = o->token_embedding_table;
 
     w->wq = quantize_tensor(o->wq, p->n_layers, p->dim * (p->n_heads * head_size));
@@ -452,17 +423,32 @@ void quantize_transformer(TransformerWeights* w, TransformerFWeights* o, Config 
     w->wcls = quantize_tensor(o->wcls, 1, p->dim * p->vocab_size);
 
     fclose(p);
-
-void build_transformer(Transformer *t, char* checkpoint_path) {
-    // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
-    // allocate the RunState buffers
-    malloc_run_state(&t->state, &t->config);
 }
 
-void free_transformer(Transformer* t, Config* p) {
+void build_transformer(Transformer *t, char* checkpoint_path, int quantizing_mode) {
 
-    for (int i = 0; i < p->n_layers; i++) {
+    if (quantizing_mode == 1) {
+        TransformerFWeights weights;
+
+        // read in the Config and the Weights from the checkpoint
+        read_checkpoint(checkpoint_path, &t->config, &weights, &t->fd, &t->data, &t->file_size);
+
+        // quantize & export the transformer
+        export_transformer(checkpoint_path, &t->config, &weights);
+
+    } else {
+
+        // 
+        import_transformer(checkpoint_path, &t->config, &t->weights);
+
+        // allocate the RunState buffers
+        malloc_run_state(&t->state, &t->config);
+    }
+}
+
+void free_transformer(Transformer* t) {
+
+    for (int i = 0; i < (t->config).n_layers; i++) {
         free(t->weights.wq[i].q);
         free(t->weights.wq[i].s);
 
@@ -500,10 +486,12 @@ void free_transformer(Transformer* t, Config* p) {
     free(t->weights.rms_ffn_weight);
     free(t->weights.rms_final_weight);
 
-    if(t->weights.wcls != t->weights.q_tokens) { free(t->weights.wcls); }
+    free(t->weights.wcls);
+    
     // close the memory mapping
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
     if (t->fd != -1) { close(t->fd); }
+
     // free the RunState buffers
     free_run_state(&t->state);
 }
