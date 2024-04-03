@@ -110,6 +110,16 @@ typedef struct {
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
+typedef struct {
+    Config config; // the hyperparameters of the architecture (the blueprint)
+    TransformerFWeights weights; // the weights of the model
+    RunState state; // buffers for the "wave" of activations in the forward pass
+    // some more state needed to properly clean up the memory mapping (sigh)
+    int fd; // file descriptor for memory mapping
+    float* data; // memory mapped data pointer
+    ssize_t file_size; // size of the checkpoint file in bytes
+} TransformerF;
+
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -195,7 +205,7 @@ void quantize(QuantizedTensor *qx, float* x, int n) {
 /* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
 QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
     void *p = *ptr;
-    QuantizedTensor *res = malloc(n * sizeof(QuantizedTensor));
+    QuantizedTensor *res = calloc(n,  sizeof(QuantizedTensor));
     for(int i=0; i<n; i++) {
         /* map quantized int8 values*/
         res[i].q = (int8_t*)p;
@@ -238,7 +248,7 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
     w->wcls = shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
 }
 
-void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
+void read_checkpoint(char* checkpoint, Config* config, TransformerFWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
@@ -270,6 +280,146 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     void* weights_ptr = ((char*)*data) + header_size; // skip header bytes. char is 1 byte
     memory_map_weights(weights, config, weights_ptr, shared_classifier);
+    export_transformer(checkpoint, config, weights);
+}
+
+/* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
+QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
+    void *p = *ptr;
+    QuantizedTensor *res = calloc(n,  sizeof(QuantizedTensor));
+    for(int i=0; i<n; i++) {
+        /* map quantized int8 values*/
+        res[i].q = (int8_t*)p;
+        p = (int8_t*)p + size_each;
+        /* map scale factors */
+        res[i].s = (float*)p;
+        p = (float*)p + size_each / GS;
+    }
+    *ptr = p; // advance ptr to current position
+    return res;
+}
+
+QuantizedTensor *import_tensor(FILE **ptr, int n, int size_each) {
+    QuantizedTensor *res = calloc(n,  sizeof(QuantizedTensor));
+    
+    for(int i=0; i<n; i++) {
+        res[i].q = calloc(size_each,  sizeof(int8_t));
+        res[i].s = calloc(size_each / GS,  sizeof(float));
+
+        fread(res[i].q, sizeof(int8_t), size_each, *ptr);
+        fread(res[i].s, sizeof(float), size_each / GS, *ptr);
+    }
+
+    return res;
+}
+
+void *import_float(FILE **ptr, int size, TransformerWeights* w) {
+
+    float *res = calloc(sizeof(float), size);
+    fread(res, sizeof(float), size, *ptr);
+
+    return res;
+}
+
+void export_tensor(QuantizedTensor *in, FILE **ptr, int n, int size_each) {
+    
+    for(int i=0; i<n; i++) {
+        fwrite(in[i].q, sizeof(int8_t), size_each, *ptr);
+        fwrite(in[i].s, sizeof(float), size_each / GS, *ptr);
+    }
+
+}
+
+void export_float(float *in, FILE **ptr, int size) {
+
+    fwrite(in, sizeof(float), size, *ptr);
+
+}
+
+void import_transformer(char* quantized_checkpoint, Config* p, TransformerWeights* w) {
+
+    FILE *ptr = fopen(quantized_checkpoint, "wb");
+    if (!ptr) { fprintf(stderr, "Couldn't open file %s\n", quantized_checkpoint); exit(EXIT_FAILURE); }
+
+    fread(&p->dim, sizeof(int), 1, ptr);
+    fread(&p->hidden_dim, sizeof(int), 1, ptr);
+    fread(&p->n_layers, sizeof(int), 1, ptr);
+    fread(&p->n_heads, sizeof(int), 1, ptr);
+    fread(&p->n_kv_heads, sizeof(int), 1, ptr);
+    fread(&p->vocab_size, sizeof(int), 1, ptr);
+    fread(&p->seq_len, sizeof(int), 1, ptr);
+    fread(&p->nb_groups, sizeof(int), 1, ptr);
+
+    int head_size = p->dim / p->n_heads;
+
+    w->rms_att_weight = import_float(&ptr, p->n_layers * p->dim);
+    w->rms_ffn_weight = import_float(&ptr, p->n_layers * p->dim);
+    w->rms_final_weight = import_float(&ptr, p->dim);
+
+    w->q_tokens = import_tensor(&ptr, 1, p->vocab_size * p->dim);
+    w->token_embedding_table = import_float(&ptr, p->vocab_size * p->dim);
+
+    w->wq = import_tensor(&ptr, p->n_layers, p->dim * (p->n_heads * head_size));
+    w->wk = import_tensor(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
+    w->wv = import_tensor(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
+    w->wo = import_tensor(&ptr, p->n_layers, (p->n_heads * head_size) * p->dim);
+
+    w->w1 = import_tensor(&ptr, p->n_layers, p->dim * p->hidden_dim);
+    w->w2 = import_tensor(&ptr, p->n_layers, p->hidden_dim * p->dim);
+    w->w3 = import_tensor(&ptr, p->n_layers, p->dim * p->hidden_dim);
+
+    w->wcls = import_tensor(&ptr, 1, p->dim * p->vocab_size);
+
+    fclose(ptr);
+}
+
+void export_transformer(char* checkpoint, Config* p, TransformerWeights* weights) {
+
+    int head_size = p->dim / p->n_heads;
+
+    TransformerWeights weights;
+
+    char export_file[256];
+    strcpy(export_file, checkpoint);
+    strcat(export_file, "_quantized");
+
+    FILE *ptr = fopen(export_file, "wb");
+    if (!ptr) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
+
+    fwrite(&p->dim, sizeof(int), 1, ptr);
+    fwrite(&p->hidden_dim, sizeof(int), 1, ptr);
+    fwrite(&p->n_layers, sizeof(int), 1, ptr);
+    fwrite(&p->n_heads, sizeof(int), 1, ptr);
+    fwrite(&p->n_kv_heads, sizeof(int), 1, ptr);
+    fwrite(&p->vocab_size, sizeof(int), 1, ptr);
+    fwrite(&p->seq_len, sizeof(int), 1, ptr);
+    fwrite(&p->nb_groups, sizeof(int), 1, ptr);
+
+    export_float(w->rms_att_weight, &ptr, p->n_layers * p->dim);
+    export_float(w->rms_ffn_weight, &ptr, p->n_layers * p->dim);
+    export_float(w->rms_final_weight, &ptr, p->dim);
+    
+    export_tensor(w->q_tokens, &ptr, 1, p->vocab_size * p->dim);
+    export_float(w->token_embedding_table, &ptr, p->vocab_size * p->dim);
+
+    export_tensor(w->wq, &ptr, p->n_layers, p->dim * (p->n_heads * head_size));
+    export_tensor(w->wk, &ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
+    export_tensor(w->wv, &ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
+    export_tensor(w->wo, &ptr, p->n_layers, (p->n_heads * head_size) * p->dim);
+    export_tensor(w->w1, &ptr, p->n_layers, p->dim * p->hidden_dim);
+    export_tensor(w->w2, &ptr, p->n_layers, p->hidden_dim * p->dim);
+    export_tensor(w->w3, &ptr, p->n_layers, p->dim * p->hidden_dim);
+    
+    export_tensor(w->wcls, &ptr, 1, p->dim * p->vocab_size);
+
+    fclose(ptr);
+}
+
+void quantize_transformer(char* checkpoint, Config* config, TransformerFWeights* f_weights) {
+
+
+
+
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
