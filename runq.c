@@ -208,57 +208,46 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
     return res;
 }
 
-void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t shared_classifier) {
+void memory_map_weights(TransformerFWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
-    // first are the parameters that are kept in fp32 (the rmsnorm (1D) weights)
-    float* fptr = (float*) ptr; // cast our pointer to float*
-    w->rms_att_weight = fptr;
-    fptr += p->n_layers * p->dim;
-    w->rms_ffn_weight = fptr;
-    fptr += p->n_layers * p->dim;
-    w->rms_final_weight = fptr;
-    fptr += p->dim;
-
-    // now read all the quantized weights
-    ptr = (void*)fptr; // now cast the pointer back to void*
-    w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim);
-    // dequantize token embedding table
-    w->token_embedding_table = malloc(p->vocab_size * p->dim * sizeof(float));
-    dequantize(w->q_tokens, w->token_embedding_table, p->vocab_size * p->dim);
-
-    w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * head_size));
-    w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
-    w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
-    w->wo = init_quantized_tensors(&ptr, p->n_layers, (p->n_heads * head_size) * p->dim);
-
-    w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
-    w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim);
-    w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
-
-    w->wcls = shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
+    // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
+    unsigned long long n_layers = p->n_layers;
+    w->token_embedding_table = ptr;
+    ptr += p->vocab_size * p->dim;
+    w->rms_att_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->wq = ptr;
+    ptr += n_layers * p->dim * (p->n_heads * head_size);
+    w->wk = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += n_layers * (p->n_heads * head_size) * p->dim;
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->w1 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->w2 = ptr;
+    ptr += n_layers * p->hidden_dim * p->dim;
+    w->w3 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += p->dim;
+    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
+    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerFWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
-    // read in magic number (uint32), has to be 0x616b3432, i.e. "ak42" in ASCII
-    uint32_t magic_number;
-    if (fread(&magic_number, sizeof(uint32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (magic_number != 0x616b3432) { fprintf(stderr, "Bad magic number\n"); exit(EXIT_FAILURE); }
-    // read in the version number (uint32), has to be 2
-    int version;
-    if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 2) { fprintf(stderr, "Bad version %d, need version 2\n", version); exit(EXIT_FAILURE); }
-    int header_size = 256; // the header size for version 2 in bytes
-    // read in the Config
+    // read in the config header
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
-    // read in flags
-    uint8_t shared_classifier; // a byte to indicate if the classifier is shared
-    if (fread(&shared_classifier, sizeof(uint8_t), 1, file) != 1) { exit(EXIT_FAILURE); }
-    int group_size; // the group size used in quantization
-    if (fread(&group_size, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    GS = group_size; // set as global, as it will be used in many places
+    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    int shared_weights = config->vocab_size > 0 ? 1 : 0;
+    config->vocab_size = abs(config->vocab_size);
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
@@ -268,8 +257,9 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerFWeights* weig
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    void* weights_ptr = ((char*)*data) + header_size; // skip header bytes. char is 1 byte
-    memory_map_weights(weights, config, weights_ptr, shared_classifier);
+    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
+    memory_map_weights(weights, config, weights_ptr, shared_weights);
+    GS = config->dim;
 }
 
 QuantizedTensor *quantize_tensor(void *f, int n, int size_each) {
@@ -288,22 +278,24 @@ QuantizedTensor *quantize_tensor(void *f, int n, int size_each) {
 
 QuantizedTensor *import_tensor(FILE **ptr, int n, int size_each) {
     QuantizedTensor *res = calloc(n,  sizeof(QuantizedTensor));
-    
+    size_t err;
+
     for(int i=0; i<n; i++) {
         res[i].q = calloc(size_each,  sizeof(int8_t));
         res[i].s = calloc(size_each / GS,  sizeof(float));
 
-        fread(res[i].q, sizeof(int8_t), size_each, *ptr);
-        fread(res[i].s, sizeof(float), size_each / GS, *ptr);
+        err = fread(res[i].q, sizeof(int8_t), size_each, *ptr);
+        err = fread(res[i].s, sizeof(float), size_each / GS, *ptr);
     }
 
     return res;
 }
 
 void *import_float(FILE **ptr, int size) {
+    size_t err;
 
     float *res = calloc(sizeof(float), size);
-    fread(res, sizeof(float), size, *ptr);
+    err = fread(res, sizeof(float), size, *ptr);
 
     return res;
 }
@@ -324,20 +316,22 @@ void export_float(float *in, FILE **ptr, int size) {
 }
 
 void import_transformer(char* quantized_checkpoint, Config* p, TransformerWeights* w) {
+    size_t err;
 
     FILE *ptr = fopen(quantized_checkpoint, "wb");
     if (!ptr) { fprintf(stderr, "Couldn't open file %s\n", quantized_checkpoint); exit(EXIT_FAILURE); }
 
-    fread(&p->dim, sizeof(int), 1, ptr);
-    fread(&p->hidden_dim, sizeof(int), 1, ptr);
-    fread(&p->n_layers, sizeof(int), 1, ptr);
-    fread(&p->n_heads, sizeof(int), 1, ptr);
-    fread(&p->n_kv_heads, sizeof(int), 1, ptr);
-    fread(&p->vocab_size, sizeof(int), 1, ptr);
-    fread(&p->seq_len, sizeof(int), 1, ptr);
-    fread(&p->nb_groups, sizeof(int), 1, ptr);
+    err = fread(&p->dim, sizeof(int), 1, ptr);
+    err = fread(&p->hidden_dim, sizeof(int), 1, ptr);
+    err = fread(&p->n_layers, sizeof(int), 1, ptr);
+    err = fread(&p->n_heads, sizeof(int), 1, ptr);
+    err = fread(&p->n_kv_heads, sizeof(int), 1, ptr);
+    err = fread(&p->vocab_size, sizeof(int), 1, ptr);
+    err = fread(&p->seq_len, sizeof(int), 1, ptr);
+    err = fread(&p->nb_groups, sizeof(int), 1, ptr);
 
     int head_size = p->dim / p->n_heads;
+    GS = p->nb_groups;
 
     w->rms_att_weight = import_float(&ptr, p->n_layers * p->dim);
     w->rms_ffn_weight = import_float(&ptr, p->n_layers * p->dim);
@@ -421,20 +415,19 @@ void quantize_transformer(TransformerWeights* w, TransformerFWeights* o, Config 
     w->w3 = quantize_tensor(o->w3, p->n_layers, p->dim * p->hidden_dim);
 
     w->wcls = quantize_tensor(o->wcls, 1, p->dim * p->vocab_size);
-
-    fclose(p);
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path, int quantizing_mode) {
 
     if (quantizing_mode == 1) {
-        TransformerFWeights weights;
+        TransformerFWeights f_weights;
 
         // read in the Config and the Weights from the checkpoint
-        read_checkpoint(checkpoint_path, &t->config, &weights, &t->fd, &t->data, &t->file_size);
+        read_checkpoint(checkpoint_path, &t->config, &f_weights, &t->fd, &t->data, &t->file_size);
 
         // quantize & export the transformer
-        export_transformer(checkpoint_path, &t->config, &weights);
+        quantize_transformer(&t->weights, &f_weights, &t->config);
+        export_transformer(checkpoint_path, &t->config, &t->weights);
 
     } else {
 
@@ -446,8 +439,9 @@ void build_transformer(Transformer *t, char* checkpoint_path, int quantizing_mod
     }
 }
 
-void free_transformer(Transformer* t) {
+void free_transformer(Transformer* t, int is_quantizing) {
 
+    // components at each layer of the feed forward net
     for (int i = 0; i < (t->config).n_layers; i++) {
         free(t->weights.wq[i].q);
         free(t->weights.wq[i].s);
@@ -471,9 +465,8 @@ void free_transformer(Transformer* t) {
         free(t->weights.w3[i].s);
     }
 
+    // single occurence components
     free(t->weights.q_tokens);
-    free(t->weights.token_embedding_table);
-
     free(t->weights.wq);
     free(t->weights.wk);
     free(t->weights.wv);
@@ -482,18 +475,21 @@ void free_transformer(Transformer* t) {
     free(t->weights.w2);
     free(t->weights.w3);
     
-    free(t->weights.rms_att_weight);
-    free(t->weights.rms_ffn_weight);
-    free(t->weights.rms_final_weight);
-
     free(t->weights.wcls);
     
-    // close the memory mapping
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    if (t->fd != -1) { close(t->fd); }
+    if (is_quantizing == 1) {
+        // close the memory mapping
+        if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
+        if (t->fd != -1) { close(t->fd); }
+    } else {
+        free(t->weights.rms_att_weight);
+        free(t->weights.rms_ffn_weight);
+        free(t->weights.rms_final_weight);
+        free(t->weights.token_embedding_table);
 
-    // free the RunState buffers
-    free_run_state(&t->state);
+        // free the RunState buffers
+        free_run_state(&t->state);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1287,6 +1283,7 @@ int main(int argc, char *argv[]) {
     build_transformer(&transformer, checkpoint_path, quantizing_mode);
 
     if (quantizing_mode == 1) {
+        free_transformer(&transformer, quantizing_mode);
         return 0;
     }
 
@@ -1313,7 +1310,7 @@ int main(int argc, char *argv[]) {
     // memory and file handles cleanup
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
+    free_transformer(&transformer, 0);
     return 0;
 }
 #endif
